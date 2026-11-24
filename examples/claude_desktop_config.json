@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "jackline",
+      "args": [
+        "mcp-proxy",
+        "--policy", "/Users/you/jackline/jackline.toml",
+        "--home", "/Users/you/jackline/.jackline",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem@<pinned-version>", "/Users/you/projects/research"
+      ]
+    }
+  }
+}

@@ -1,0 +1,89 @@
+# Equity-research copilot — example policy for a capital-markets desk.
+[jackline]
+name = "equity-research-copilot"
+default = "deny"          # anything not explicitly allowed is blocked
+workspace = "."
+
+[approvals]
+timeout = "2m"            # unanswered approvals expire to DENY
+
+[budget]
+max_steps = 60
+max_tool_calls = 25
+max_tokens = 80000
+max_cost_usd = 0.50
+
+[budget.prices.demo-model]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+[[rule]]
+id = "never-touch-credentials"
+tools = ["fs.*"]
+effect = "deny"
+reason = "credential and key material is off-limits to agents"
+[rule.when]
+path_matches = ["*/.ssh/*", "*/.aws/*", "*.pem", "*.env", "*/.config/gcloud/*", "id_rsa*"]
+
+[[rule]]
+id = "stay-in-research-workspace"
+tools = ["fs.*"]
+effect = "deny"
+reason = "file access outside the research workspace"
+[rule.when]
+path_not_within = ["research"]
+
+[[rule]]
+id = "read-research"
+tools = ["fs.read", "fs.list"]
+effect = "allow"
+[rule.when]
+path_within = ["research"]
+
+[[rule]]
+id = "egress-allowlist"
+tools = ["web.*"]
+effect = "deny"
+reason = "destination is not on the egress allowlist"
+[rule.when]
+host_not_in = ["sec.gov", "firm.internal"]
+
+[[rule]]
+id = "market-data"
+tools = ["web.get"]
+effect = "allow"
+rate = "5/min"
+[rule.when]
+host_in = ["sec.gov", "firm.internal"]
+
+[[rule]]
+id = "no-secrets-outbound"
+tools = ["email.send", "web.post"]
+effect = "deny"
+reason = "outbound content contains credential material"
+[rule.when]
+args_contain = ["AKIA[A-Z2-7]{16}", "-----BEGIN", "sk-[A-Za-z0-9]{8,}"]
+
+[[rule]]
+id = "email-the-desk"
+tools = ["email.send"]
+effect = "approve"
+approvers = ["head-of-research"]
+reason = "desk communications need a human sign-off"
+[rule.when]
+arg_matches = { to = "@firm\\.internal$" }
+
+[[rule]]
+id = "orders-need-risk"
+tools = ["trade.submit"]
+effect = "approve"
+approvers = ["risk-desk"]
+reason = "every order needs risk-desk approval"
+
+[[rule]]
+id = "large-orders-blocked"
+tools = ["trade.submit"]
+effect = "deny"
+reason = "notional above $1M is outside any agent's mandate"
+[rule.when]
+arg_gt = { notional_usd = 1000000 }

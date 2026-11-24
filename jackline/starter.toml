@@ -1,0 +1,68 @@
+# Jackline policy — starter template (`jackline init`).
+# Precedence is fixed: any matching DENY wins, then APPROVE, then ALLOW, then `default`.
+# Unknown keys are rejected, so a typo can never silently disable a rule.
+
+[jackline]
+name = "my-agent"
+default = "deny"          # fail closed: anything not allowed below is blocked
+workspace = "."           # relative paths in rules resolve from here
+
+[approvals]
+timeout = "5m"            # unanswered approval requests expire to DENY
+
+[budget]
+max_steps = 50
+max_tool_calls = 100
+max_tokens = 200000
+max_cost_usd = 5.00
+max_wall_time = "30m"
+
+# [budget.prices.my-model]
+# input_per_mtok = 3.0
+# output_per_mtok = 15.0
+
+# --- files -----------------------------------------------------------------
+[[rule]]
+id = "never-touch-credentials"
+tools = ["fs.*", "read_file", "write_file"]
+effect = "deny"
+reason = "credential and key material is off-limits to agents"
+[rule.when]
+path_matches = ["*/.ssh/*", "*/.aws/*", "*/.config/gcloud/*", "*.pem", "*.key", "*.env", "id_rsa*"]
+
+[[rule]]
+id = "read-project"
+tools = ["fs.read", "fs.list", "read_file", "list_directory"]
+effect = "allow"
+[rule.when]
+path_within = ["."]
+
+[[rule]]
+id = "writes-need-review"
+tools = ["fs.write", "write_file", "edit_file"]
+effect = "approve"
+reason = "file changes need a human"
+[rule.when]
+path_within = ["."]
+
+# --- network ---------------------------------------------------------------
+[[rule]]
+id = "egress-allowlist"
+tools = ["web.*", "fetch"]
+effect = "deny"
+reason = "destination is not on the egress allowlist"
+[rule.when]
+host_not_in = ["api.github.com", "docs.python.org"]
+
+[[rule]]
+id = "web-read"
+tools = ["web.get", "fetch"]
+effect = "allow"
+rate = "30/min"
+
+# --- anything with side effects ---------------------------------------------
+[[rule]]
+id = "shell-needs-human"
+tools = ["shell.*", "run_command", "execute_command"]
+effect = "approve"
+reason = "command execution needs a human"
