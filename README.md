@@ -11,6 +11,10 @@ pip install git+https://github.com/TAM-DS/jackline
 jackline demo        # a prompt-injected agent tries to rob the desk; nothing gets through
 ```
 
+<p align="center">
+  <img src="docs/demo.png" alt="jackline demo: a prompt-injected research copilot tries to read AWS credentials, exfiltrate data, run a shell script and place a $2.5M trade; every action is denied, sent to a human or throttled, and the signed ledger verifies" width="900">
+</p>
+
 ---
 
 ## Why "Jackline"
