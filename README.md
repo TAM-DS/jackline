@@ -72,7 +72,7 @@ task    "Summarise ACME's Q3 notes and email the desk"
                                  ✔ head-of-research APPROVED
                                  ↳ executed: queued to equities-desk@firm.internal (simulated)
   9-13 ✔ ALLOW     web.get       sec.gov  ×5                                  market-data
- 14-25 ⏳ THROTTLE  web.get       sec.gov  ×12                                 market-data
+ 14-25 ↻ THROTTLE  web.get       sec.gov  ×12                                 market-data
        ■ HALT      budget exceeded: max_tool_calls = 26 (cap 25) — run stopped safely
 
 Outcome  25 actions proposed · 7 executed · 6 blocked · 12 throttled · 2 sent to a human (1 approved)

@@ -251,7 +251,7 @@ def run_demo(out: TextIO = sys.stdout, home: Path | None = None, color: bool | N
     session = rt.session("Summarise ACME's Q3 notes and email the desk", grant)
     results: list[tuple[dict[str, Any], ToolResult]] = []
     halted = None
-    label = {"ok": ("✔ ALLOW   ", "ok"), "deny": ("✘ DENY    ", "deny"), "throttle": ("⏳ THROTTLE", "throttle")}
+    label = {"ok": ("✔ ALLOW   ", "ok"), "deny": ("✘ DENY    ", "deny"), "throttle": ("↻ THROTTLE", "throttle")}
     loop_buf: list[tuple[int, ToolResult]] = []
 
     def flush_loop() -> None:
