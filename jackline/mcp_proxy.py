@@ -20,10 +20,11 @@ import json
 import subprocess
 import sys
 import threading
+import uuid
 from typing import IO, Any
 
 from .grants import Grant
-from .runtime import BudgetExceeded, Runtime
+from .runtime import Runtime
 
 
 class MCPProxy:
@@ -38,8 +39,10 @@ class MCPProxy:
         self.client_in = client_in or sys.stdin.buffer
         self.client_out = client_out or sys.stdout.buffer
         self.timeout = upstream_timeout_s
-        self.session = runtime.session(f"mcp-proxy: {' '.join(upstream_cmd)}", grant)
+        self.session = runtime.session(f"mcp-proxy: {' '.join(upstream_cmd)}", grant,
+                                       task_id=grant.task_id if grant else "mcp-proxy")
         self._out_lock = threading.Lock()
+        self._upstream_lock = threading.Lock()
         self._call_lock = threading.Lock()
         self._ids = itertools.count(1)
         self._waiters: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
@@ -54,11 +57,12 @@ class MCPProxy:
 
     def _send_upstream(self, msg: dict[str, Any]) -> None:
         assert self.proc and self.proc.stdin
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-        self.proc.stdin.flush()
+        with self._upstream_lock:
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+            self.proc.stdin.flush()
 
     def _forward(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        uid = f"jackline-{next(self._ids)}"
+        uid = f"jackline-{uuid.uuid4().hex}"
         ev, box = threading.Event(), {}
         self._waiters[uid] = (ev, box)
         self._send_upstream({"jsonrpc": "2.0", "id": uid, "method": "tools/call",
@@ -98,12 +102,18 @@ class MCPProxy:
     # ----------------------------------------------------------- tool calls
     def _handle_call(self, msg: dict[str, Any]) -> None:
         cid = msg.get("id")
-        params = msg.get("params") or {}
-        name = str(params.get("name", ""))
-        args = params.get("arguments") or {}
+        params = msg.get("params", {})
+        if not isinstance(params, dict) or not isinstance(params.get("name"), str) or not params["name"] or not isinstance(params.get("arguments", {}), dict):
+            self._send_client({"jsonrpc": "2.0", "id": cid, "error": {"code": -32602, "message": "invalid tool parameters"}})
+            return
+        name = params["name"]
+        args = params.get("arguments", {})
         tool = self.prefix + name
         if tool not in self.rt.tools:
-            self.rt.register(tool, lambda _n=name, **a: self._forward(_n, a), side_effect=True,
+            # Capture the dispatch name in a closure, never a keyword-overridable default.
+            def forward(**arguments):
+                return self._forward(name, arguments)
+            self.rt.register(tool, forward, side_effect=True,
                              description="forwarded to upstream MCP server")
         try:
             with self._call_lock:
@@ -113,7 +123,7 @@ class MCPProxy:
                     "content": [{"type": "text", "text": str(res.output)}]}
             else:
                 result = {"content": [{"type": "text", "text": res.message()}], "isError": True}
-        except BudgetExceeded as exc:
+        except Exception as exc:
             result = {"content": [{"type": "text", "text": f"[jackline] {exc}"}], "isError": True}
         self._send_client({"jsonrpc": "2.0", "id": cid, "result": result})
 
@@ -131,8 +141,16 @@ class MCPProxy:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(msg, dict):
+                    continue
                 method = msg.get("method")
-                if method == "tools/call" and "id" in msg:
+                if method == "tools/call" and ("id" not in msg or msg["id"] is None):
+                    # Tool calls are requests. Never forward an ungated notification.
+                    self.rt.ledger.append(self.session.run_id, "mcp.invalid_call", {"reason": "missing request id"})
+                    continue
+                if "id" in msg and (type(msg["id"]) not in (str, int)):
+                    continue
+                if method == "tools/call":
                     t = threading.Thread(target=self._handle_call, args=(msg,), daemon=True)
                     t.start()
                     workers.append(t)

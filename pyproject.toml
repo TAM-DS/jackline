@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jackline"
-version = "0.1.0"
+version = "0.1.1"
 description = "The governed runtime for AI agents: task-scoped grants, deterministic policy, human approvals, budgets and a signed ledger. Clip in. Work freely. Never go overboard."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -15,10 +15,13 @@ keywords = ["ai-agents", "agent-runtime", "agent-governance", "mcp", "human-in-t
 classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX",
   "Topic :: Security",
   "Intended Audience :: Developers",
 ]
+
+[project.optional-dependencies]
+approvals = ["cryptography>=43"]
 
 [project.urls]
 Homepage = "https://github.com/TAM-DS/jackline"

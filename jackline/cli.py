@@ -89,7 +89,8 @@ def cmd_grant(a) -> int:
 
 
 def cmd_approvals(a) -> int:
-    store = ApprovalStore(a.home / "approvals", _key(a.home))
+    keys = Policy.load(a.policy).approver_keys if a.policy else {}
+    store = ApprovalStore(a.home / "approvals", _key(a.home), keys, a.trusted_local)
     try:
         if a.action == "list":
             items = store.list(None if a.status == "all" else a.status)
@@ -106,7 +107,8 @@ def cmd_approvals(a) -> int:
             print(json.dumps({k: v for k, v in x.__dict__.items() if k != "sig"}, indent=2, default=str))
             return 0
         by = a.by or os.environ.get("USER", "unknown")
-        x = store.resolve(a.id, a.action == "approve", by, a.reason)
+        x = store.resolve(a.id, a.action == "approve", by, a.reason,
+                          bytes.fromhex(a.signing_key.read_text().strip()) if a.signing_key else None)
         print(f"{x.id} {x.status} by {x.resolved_by}")
         return 0
     except ApprovalError as e:
@@ -154,7 +156,7 @@ def cmd_mcp_proxy(a) -> int:
         print("usage: jackline mcp-proxy --policy P [--grant G] -- <upstream command ...>", file=sys.stderr)
         return 2
     rt = Runtime(Policy.load(a.policy), home=a.home, require_grant=bool(a.grant) or a.require_grant,
-                 approval_mode="wait")
+                 approval_mode="wait", trusted_local_approvals=a.trusted_local)
     grant = Grant.load(a.grant) if a.grant else None
     return MCPProxy(rt, cmd, grant=grant, prefix=a.prefix).serve()
 
@@ -190,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("grant", help="issue a task-scoped, expiring, signed grant")
     g.add_argument("--task", required=True)
-    g.add_argument("--scope", action="append", required=True, help="tool glob; repeatable")
+    g.add_argument("--scope", action="append", required=True, help="exact tool name; repeatable")
     g.add_argument("--ttl", default="15m")
     g.add_argument("--by", required=True, help="who is granting this authority")
     g.add_argument("--max-calls", type=int)
@@ -206,6 +208,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--by")
     ap.add_argument("--reason", default="")
     ap.add_argument("--home", **home)
+    ap.add_argument("--policy", type=Path, help="policy containing trusted approver public keys")
+    ap.add_argument("--signing-key", type=Path, help="external approver Ed25519 private key (hex)")
+    ap.add_argument("--trusted-local", action="store_true", help="demo only: accept unauthenticated identity labels")
     ap.set_defaults(func=cmd_approvals)
 
     lg = sub.add_parser("ledger", help="verify or show the signed run ledger")
@@ -229,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--policy", type=Path, required=True)
     mp.add_argument("--grant", type=Path)
     mp.add_argument("--require-grant", action="store_true")
+    mp.add_argument("--trusted-local", action="store_true", help="demo only: trust local approval labels")
     mp.add_argument("--prefix", default="", help="prefix tool names for policy matching, e.g. 'github.'")
     mp.add_argument("--home", **home)
     mp.add_argument("command", nargs=argparse.REMAINDER)

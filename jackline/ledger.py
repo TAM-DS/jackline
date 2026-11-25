@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from pathlib import Path
 from typing import Any, Iterator
 
+from .storage import locked, private_dir
 from .util import canonical, iso, now, redact, sha256, sign, verify_sig
 
 GENESIS = "0" * 64
@@ -25,14 +25,20 @@ class Ledger:
         self.path = Path(path)
         self.key = key
         self.fsync = fsync
-        self._lock = threading.Lock()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        private_dir(self.path.parent)
         self._seq, self._prev = 0, GENESIS
-        for e in read(self.path):
-            self._seq, self._prev = e["seq"], e["hash"]
+        with locked(self.path.with_suffix(".lock")):
+            self._refresh()
+
+    def _refresh(self) -> None:
+        ok, message, count, head = verify(self.path, self.key)
+        if not ok:
+            raise ValueError(message)
+        self._seq, self._prev = count, head
 
     def append(self, run_id: str, type_: str, data: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
+        with locked(self.path.with_suffix(".lock")):
+            self._refresh()
             body = {
                 "seq": self._seq + 1,
                 "ts": iso(now()),
@@ -43,7 +49,9 @@ class Ledger:
             }
             h = sha256(canonical(body))
             entry = {**body, "hash": h, "sig": sign(self.key, h)}
-            with self.path.open("a", encoding="utf-8") as fh:
+            fd = os.open(self.path, os.O_APPEND | os.O_WRONLY | os.O_CREAT, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, sort_keys=True) + "\n")
                 fh.flush()
                 if self.fsync:
@@ -52,7 +60,9 @@ class Ledger:
             return entry
 
     def head(self) -> str:
-        return self._prev
+        with locked(self.path.with_suffix(".lock")):
+            self._refresh()
+            return self._prev
 
 
 def read(path: str | Path) -> Iterator[dict[str, Any]]:
@@ -81,7 +91,7 @@ def verify(path: str | Path, key: bytes, anchor: str | None = None) -> tuple[boo
             if not verify_sig(key, e["hash"], e.get("sig", "")):
                 return False, f"entry {n}: signature invalid — not written by this key", n, prev
             prev, seq = e["hash"], e["seq"]
-    except (json.JSONDecodeError, KeyError) as exc:
+    except (ValueError, TypeError, KeyError) as exc:
         return False, f"entry {n}: unreadable ({exc})", n, prev
     if anchor and not prev.startswith(anchor):
         return False, f"head {prev[:16]} does not match anchor {anchor[:16]} — ledger truncated or replaced", n, prev

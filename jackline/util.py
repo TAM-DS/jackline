@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -59,12 +60,17 @@ _DUR = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?\s*$")
 def parse_duration(value: str | int | float) -> float:
     """'90s' / '15m' / '2h' / '1d' / 30 → seconds."""
     if isinstance(value, (int, float)):
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError("duration must be positive and finite")
         return float(value)
     m = _DUR.match(value)
     if not m:
         raise ValueError(f"bad duration: {value!r}")
     n, unit = float(m.group(1)), m.group(2) or "s"
-    return n * {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    result = n * {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError("duration must be positive and finite")
+    return result
 
 
 def load_or_create_key(path: Path, env: str = "JACKLINE_KEY") -> bytes:
@@ -72,20 +78,28 @@ def load_or_create_key(path: Path, env: str = "JACKLINE_KEY") -> bytes:
     otherwise a 256-bit key is generated once and stored owner-read-only."""
     if os.environ.get(env):
         return os.environ[env].encode()
-    if path.exists():
-        return path.read_bytes().strip()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    key = secrets.token_hex(32).encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(key)
-    return key
+    from .storage import locked, private_dir
+    private_dir(path.parent)
+    with locked(path.with_suffix(".keylock")):
+        if path.exists():
+            key = path.read_bytes().strip()
+            if not key:
+                raise ValueError("runtime key file is empty")
+            path.chmod(0o600)
+            return key
+        key = secrets.token_hex(32).encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(key)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return key
 
 
 # ------------------------------------------------------------------ redaction
 _SECRET_KEY = re.compile(r"(?i)(secret|token|passw|pwd|api[_\-]?key|authorization|cookie|credential|private[_\-]?key)")
 _SECRET_VAL = re.compile(
-    r"(AKIA[A-Z2-7]{16}|sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}|gh[pousr]_[A-Za-z0-9]{36}|"
+    r"(AKIA[A-Z0-9]{16}|sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}|gh[pousr]_[A-Za-z0-9]{36}|"
     r"xox[baprs]-[A-Za-z0-9\-]{10,}|eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}|"
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
@@ -93,13 +107,15 @@ _SECRET_VAL = re.compile(
 
 def redact(obj: Any, _key: str = "") -> Any:
     """Mask credential-looking values before anything is written to the ledger."""
+    if _key and _SECRET_KEY.search(_key) and isinstance(obj, (str, list, tuple, dict)) and obj:
+        return "[REDACTED]"
     if isinstance(obj, dict):
         return {k: redact(v, str(k)) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [redact(v, _key) for v in obj]
     if isinstance(obj, str):
-        if _key and _SECRET_KEY.search(_key) and obj:
-            return "[REDACTED]"
+        obj = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+                     "[REDACTED]", obj, flags=re.DOTALL)
         return _SECRET_VAL.sub("[REDACTED]", obj)
     return obj
 

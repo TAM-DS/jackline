@@ -33,13 +33,13 @@ home = Path(tempfile.mkdtemp())
 
 
 def support_lead(approval):
-    """Stands in for a human. In production: `jackline approvals approve <id> --by <you>`."""
+    """Simulated reviewer only. Real approvals require a separate signing key; see docs/enforcement.md."""
     ok = approval.args["amount"] <= 50
     return ok, "support-lead", "within refund policy" if ok else "over the $50 agent limit"
 
 
 rt = Runtime(Policy.from_toml(POLICY, base_dir=home), home=home / ".jackline",
-             approval_mode="callback", approver=support_lead)
+             approval_mode="callback", approver=support_lead, trusted_local_approvals=True)
 
 
 @rt.tool("docs.read")
@@ -53,7 +53,7 @@ def refund(order: str, amount: float) -> str:
 
 
 grant = issue(rt.key, "ticket-4471", ["docs.read", "billing.refund"], "10m", issued_by="support-lead")
-session = rt.session("handle ticket 4471", grant)
+session = rt.session("handle ticket 4471", grant, task_id="ticket-4471")
 
 for tool, args in [("docs.read", {"path": "docs/faq.md"}),
                    ("docs.read", {"path": "/etc/passwd"}),

@@ -237,7 +237,7 @@ def run_demo(out: TextIO = sys.stdout, home: Path | None = None, color: bool | N
     (base / "research" / "acme_q3_notes.md").write_text(INJECTED_NOTES)
     (base / "jackline.toml").write_text(POLICY_TOML.lstrip())
     policy = Policy.load(base / "jackline.toml")
-    rt = Runtime(policy, home=base / ".jackline", approval_mode="callback", approver=_humans, fsync=False)
+    rt = Runtime(policy, home=base / ".jackline", approval_mode="callback", approver=_humans, fsync=False, trusted_local_approvals=True)
     _simulated_tools(rt, base)
     grant = issue(rt.key, "acme-q3-summary", ["fs.read", "fs.list", "web.get", "email.send", "trade.submit"],
                   "15m", issued_by="tracy@desk", note="summarise ACME Q3 and email the desk")
@@ -248,7 +248,7 @@ def run_demo(out: TextIO = sys.stdout, home: Path | None = None, color: bool | N
     w(c("dim", f"grant   {grant.grant_id} · {', '.join(grant.scopes)} · 15m · issued by {grant.issued_by}\n"))
     w(c("dim", "task    \"Summarise ACME's Q3 notes and email the desk\"\n\n"))
 
-    session = rt.session("Summarise ACME's Q3 notes and email the desk", grant)
+    session = rt.session("Summarise ACME's Q3 notes and email the desk", grant, task_id="acme-q3-summary")
     results: list[tuple[dict[str, Any], ToolResult]] = []
     halted = None
     label = {"ok": ("✔ ALLOW   ", "ok"), "deny": ("✘ DENY    ", "deny"), "throttle": ("↻ THROTTLE", "throttle")}

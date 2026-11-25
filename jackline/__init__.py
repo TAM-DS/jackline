@@ -3,7 +3,7 @@
 Clip in. Work freely. Never go overboard.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .grants import Grant, issue  # noqa: E402
 from .policy import Decision, Policy, PolicyError  # noqa: E402

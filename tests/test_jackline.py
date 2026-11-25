@@ -96,14 +96,14 @@ class TmpCase(unittest.TestCase):
 
     def runtime(self, **kw) -> Runtime:
         policy = kw.pop("policy", None) or make_policy(self.tmp, kw.pop("timeout", "5m"), kw.pop("max_calls", 100))
-        rt = Runtime(policy, home=self.tmp / ".jackline", key=KEY, fsync=False, **kw)
+        rt = Runtime(policy, home=self.tmp / ".jackline", key=KEY, fsync=False, trusted_local_approvals=True, **kw)
         rt.register("fs.read", lambda path: f"contents of {path}")
         rt.register("web.get", lambda url: f"GET {url}")
         rt.register("pay.send", lambda to, amount: f"paid {amount} to {to}", side_effect=True)
         return rt
 
     def grant(self, scopes=("fs.read", "web.get", "pay.send"), ttl="10m", **kw):
-        return issue(KEY, "task-1", list(scopes), ttl, "tester", **kw)
+        return issue(KEY, "t", list(scopes), ttl, "tester", **kw)
 
 
 # ------------------------------------------------------------------ policy
@@ -247,7 +247,7 @@ class TestApprovals(TmpCase):
         with self.assertRaises(ApprovalError):
             rt.session("t", self.grant()).call("pay.send", {"to": "v", "amount": 50})
 
-    def test_suspend_resume_executes_exactly_once(self):
+    def test_completed_call_replayed_after_suspend_resume(self):
         paid = []
         rt = self.runtime()
         rt.register("pay.send", lambda to, amount: paid.append(amount) or "paid", side_effect=True)
