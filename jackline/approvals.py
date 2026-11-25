@@ -2,20 +2,21 @@
 
 An approval is bound to the *exact* call (a digest of tool + arguments). If
 an agent proposes `trade.submit {qty: 100}` and a human approves it, that
-approval cannot be reused for `{qty: 100000}`. Records are HMAC-signed, so a
-hand-edited "approved" file is rejected. Unanswered requests expire to DENY.
+approval cannot be reused for `{qty: 100000}`. Queue envelopes are HMAC-signed;
+secure-mode decisions additionally require the reviewer's separate Ed25519
+signature. Pending and approved requests expire before execution.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .util import digest, iso, now, sign, verify_sig
+from .util import canonical, digest, iso, now, sign, verify_sig
+from .storage import locked, private_dir, write_json
 
 PENDING, APPROVED, DENIED, EXPIRED = "pending", "approved", "denied", "expired"
 
@@ -36,6 +37,8 @@ class Approval:
     resolved_by: str | None = None
     resolved_at: float | None = None
     reason: str = ""
+    policy_digest: str = ""
+    approver_sig: str = ""
     sig: str = ""
 
     def body(self) -> dict[str, Any]:
@@ -44,15 +47,24 @@ class Approval:
         return d
 
 
+    def decision_body(self) -> dict[str, Any]:
+        body = self.body()
+        body.pop("approver_sig")
+        return body
+
+
 class ApprovalError(Exception):
     pass
 
 
 class ApprovalStore:
-    def __init__(self, root: str | Path, key: bytes) -> None:
+    def __init__(self, root: str | Path, key: bytes, public_keys: dict[str, str] | None = None,
+                 trusted_local: bool = False) -> None:
         self.root = Path(root)
         self.key = key
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.public_keys = dict(public_keys or {})
+        self.trusted_local = trusted_local
+        private_dir(self.root)
 
     def _path(self, aid: str) -> Path:
         if not aid.isalnum():
@@ -61,20 +73,18 @@ class ApprovalStore:
 
     def _write(self, a: Approval) -> None:
         a.sig = sign(self.key, a.body())
-        tmp = self._path(a.id).with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(a), indent=2, sort_keys=True))
-        os.replace(tmp, self._path(a.id))
+        write_json(self._path(a.id), asdict(a))
 
     def request(self, run_id: str, call_id: str, tool: str, args_redacted: dict[str, Any], call_digest: str,
-                reasons: list[str], approvers: list[str], timeout_s: float) -> Approval:
-        aid = digest([run_id, call_id, call_digest])[:12]
+                reasons: list[str], approvers: list[str], timeout_s: float, policy_digest: str = "") -> Approval:
+        aid = digest([run_id, call_id, call_digest, policy_digest])[:24]
         existing = self.get(aid, missing_ok=True)
         if existing:
             return existing
         t = now()
         a = Approval(id=aid, run_id=run_id, call_id=call_id, tool=tool, args=args_redacted,
                      call_digest=call_digest, reasons=reasons, approvers=approvers,
-                     requested_at=t, expires_at=t + timeout_s)
+                     requested_at=t, expires_at=t + timeout_s, policy_digest=policy_digest)
         self._write(a)
         return a
 
@@ -87,9 +97,16 @@ class ApprovalStore:
         a = Approval(**json.loads(p.read_text()))
         if not verify_sig(self.key, a.body(), a.sig):
             raise ApprovalError(f"approval {aid} failed signature check — file was edited by hand")
-        if a.status == PENDING and now() >= a.expires_at:
-            a.status, a.resolved_at, a.reason = EXPIRED, now(), "no decision before timeout (fail-closed)"
-            self._write(a)
+        if a.id != aid:
+            raise ApprovalError("approval id mismatch")
+        if a.status in (APPROVED, DENIED):
+            if a.approvers and a.resolved_by not in a.approvers:
+                raise ApprovalError("signer is not an authorized approver")
+            if not self.trusted_local:
+                self._verify_decision(a)
+        if a.status in (PENDING, APPROVED) and now() >= a.expires_at:
+            # Derive expiry without rewriting (and invalidating) the human's signature.
+            a.status, a.reason = EXPIRED, "approval expired before execution (fail-closed)"
         return a
 
     def find(self, prefix: str) -> Approval:
@@ -109,16 +126,33 @@ class ApprovalStore:
                 out.append(a)
         return sorted(out, key=lambda a: a.requested_at)
 
-    def resolve(self, aid: str, approve: bool, by: str, reason: str = "") -> Approval:
-        a = self.find(aid)
-        if a.status != PENDING:
-            raise ApprovalError(f"approval {a.id} is already {a.status}")
-        if a.approvers and by not in a.approvers:
-            raise ApprovalError(f"{by!r} is not an authorised approver for this action ({', '.join(a.approvers)})")
-        a.status = APPROVED if approve else DENIED
-        a.resolved_by, a.resolved_at, a.reason = by, now(), reason
-        self._write(a)
-        return a
+    def _verify_decision(self, a: Approval) -> None:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            public = bytes.fromhex(self.public_keys[a.resolved_by])
+            Ed25519PublicKey.from_public_bytes(public).verify(
+                bytes.fromhex(a.approver_sig), canonical(a.decision_body()).encode())
+        except Exception as exc:
+            raise ApprovalError("decision requires a valid signature from a configured approver; install jackline[approvals]") from exc
+
+    def resolve(self, aid: str, approve: bool, by: str, reason: str = "",
+                private_key: bytes | None = None) -> Approval:
+        with locked(self.root / "decisions.lock"):
+            a = self.find(aid)
+            if a.status != PENDING:
+                raise ApprovalError(f"approval {a.id} is already {a.status}")
+            if a.approvers and by not in a.approvers:
+                raise ApprovalError(f"{by!r} is not an authorised approver for this action")
+            a.status = APPROVED if approve else DENIED
+            a.resolved_by, a.resolved_at, a.reason = by, now(), reason
+            if private_key is not None:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                a.approver_sig = Ed25519PrivateKey.from_private_bytes(private_key).sign(
+                    canonical(a.decision_body()).encode()).hex()
+            if not self.trusted_local:
+                self._verify_decision(a)
+            self._write(a)
+            return a
 
     def wait(self, aid: str, poll_s: float = 0.25) -> Approval:
         while True:

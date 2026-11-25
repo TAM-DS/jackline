@@ -17,7 +17,7 @@ from jackline.adapters import anthropic_tool_results, anthropic_tools
 # Copy examples/policies/capital-markets.toml to ./jackline.toml first; paths in rules resolve from its folder.
 policy = Policy.load("jackline.toml")
 rt = Runtime(policy, home=".jackline", approval_mode="wait")  # approve from another terminal:
-#                                                                jackline approvals list / approve <id> --by you
+# See docs/enforcement.md: configure reviewer public keys and sign decisions externally.
 
 
 @rt.tool("fs.read")
@@ -40,17 +40,32 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}},
 ]
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# Disable automatic retries: each generation request gets one reservation.
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], max_retries=0)
+model = os.environ["MODEL"]  # configure this exact model's input/output prices in jackline.toml
+input_bound = int(os.environ.get("INPUT_TOKEN_BOUND", "16000"))
+output_bound = 1024
+if policy.budget.max_cost_usd is not None and model not in policy.budget.prices:
+    raise ValueError("Configure MODEL prices in jackline.toml before running this example")
 grant = issue(rt.key, "acme-q3", ["fs.read", "email.send"], "15m", issued_by=os.environ.get("USER", "me"))
-session = rt.session("Summarise research/acme_q3_notes.md and email equities-desk@firm.internal", grant)
+session = rt.session("Summarise research/acme_q3_notes.md and email equities-desk@firm.internal", grant, task_id="acme-q3")
 
 messages = [{"role": "user", "content": session.task}]
 while True:
     session.step()
-    resp = client.messages.create(model=os.environ.get("MODEL", "claude-sonnet-5-5"), max_tokens=1024,
-                                  tools=anthropic_tools(rt, TOOLS), messages=messages)
+    request = {"model": model, "tools": anthropic_tools(rt, TOOLS), "messages": messages}
+    # Token counting is a separate provider API, not a generation call. Establish
+    # a conservative complete-input bound; provider estimates may need headroom.
+    count = client.messages.count_tokens(**request).input_tokens
+    if count > input_bound:
+        raise ValueError("Input exceeds the configured reservation; shorten the conversation")
+    resp = session.call_model(lambda: client.messages.create(**request, max_tokens=output_bound),
+                              model=model, input_tokens_bound=input_bound, output_tokens_bound=output_bound)
+    if resp.usage.input_tokens > input_bound or resp.usage.output_tokens > output_bound:
+        session.finish("halted", "provider usage exceeded reservation; investigate before continuing")
+        raise RuntimeError("Provider exceeded declared bounds; a hard spend ceiling is not established")
     messages.append({"role": "assistant", "content": resp.content})
-    results = anthropic_tool_results(session, resp)  # ← Jackline decides every tool call here
+    results = anthropic_tool_results(session, resp, record_usage=False)  # ← Jackline decides every tool call here
     if not results:
         break
     messages.append({"role": "user", "content": results})

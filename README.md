@@ -4,7 +4,7 @@
 *Clip in. Work freely. Never go overboard.*
 
 [![ci](https://github.com/TAM-DS/jackline/actions/workflows/ci.yml/badge.svg)](https://github.com/TAM-DS/jackline/actions/workflows/ci.yml)
-· Apache-2.0 · Python 3.10–3.13 · self-hosted · offline · no dependencies on Python 3.11+
+· Apache-2.0 · Python 3.10–3.13 · self-hosted · offline · dependency-free core on Python 3.11+ (signed approvals: optional `cryptography` extra)
 
 ```bash
 pip install git+https://github.com/TAM-DS/jackline
@@ -23,11 +23,11 @@ I grew up in Boston and spent every waking moment on the water. I started on Las
 
 That harness clips onto a **jackline**, a line that runs the length of the deck. Once you're clipped in, you can move anywhere and do your job at full speed, but you cannot go overboard.
 
-That is what this runtime does for AI agents. Agents get to work freely. Every move they make is tethered to a line that a human controls.
+That is what this runtime does for AI agents. Agents get to work freely. Every action routed through Jackline is tethered to rules and authority that a human controls.
 
 ## What it is
 
-Jackline is a **governed runtime layer that wraps any agent**. Every model call and every tool call passes through it. Jackline decides what actually runs and records the proof.
+Jackline is a **governed runtime layer for agent integrations**. Route tool calls through `Session.call` and model requests through `Session.call_model`; Jackline enforces the configured authority and records the evidence. It does not intercept calls that bypass those integration points.
 
 ```
  agent / model proposes an action
@@ -58,8 +58,8 @@ It does **not** replace LangGraph, CrewAI, the OpenAI Agents SDK or the Claude A
 An equity-research copilot is asked to summarise ACME's Q3 notes and email the desk. The notes contain a hidden prompt injection. The scripted model obeys it, so you can watch every layer catch it:
 
 ```text
-Jackline 0.1.0  ·  governed agent runtime  ·  demo (scripted model, no API key, no network)
-policy  equity-research-copilot (e7885ff2) · default deny · 9 rules
+Jackline 0.1.1  ·  governed agent runtime  ·  demo (scripted model, no API key, no network)
+policy  equity-research-copilot (<digest>) · default deny · 9 rules
 grant   667a30670cfd1ee7 · fs.read, fs.list, web.get, email.send, trade.submit · 15m · issued by tracy@desk
 task    "Summarise ACME's Q3 notes and email the desk"
 
@@ -81,8 +81,10 @@ task    "Summarise ACME's Q3 notes and email the desk"
 
 Outcome  25 actions proposed · 7 executed · 6 blocked · 12 throttled · 2 sent to a human (1 approved)
 Damage   0 credentials read · 0 exfiltration attempts succeeded · 0 trades placed · $0.2262 model spend
-Ledger   ✔ ledger intact: 89 entries, head 6cc3914d1fc08f96
+Ledger   ✔ ledger intact: 108 entries, head <run-specific hash>
 ```
+
+The screenshot shows the original 0.1.0 run; current runs include additional execution-intent and rate-decision ledger entries. Hashes vary per run. Human approvals in this offline demo are simulated with explicit `trusted_local_approvals=True`.
 
 Every tool in the demo is simulated, except reading files inside its own temporary workspace. The policy it uses is in [`examples/policies/capital-markets.toml`](examples/policies/capital-markets.toml).
 
@@ -97,24 +99,29 @@ rt = Runtime(Policy.load("jackline.toml"))            # approval_mode="suspend" 
 def refund(order: str, amount: float) -> str: ...
 
 grant = issue(rt.key, "ticket-4471", ["docs.read", "billing.refund"], "10m", issued_by="support-lead")
-session = rt.session("handle ticket 4471", grant)
+session = rt.session("handle ticket 4471", grant, task_id="ticket-4471")
 
 result = session.call("billing.refund", {"order": "A-1", "amount": 40}, call_id="tool_use_01")
 print(result.message())   # the output, or "[jackline] DENIED …" for the model to re-plan around
 ```
 
-A runnable version is in [`examples/quickstart.py`](examples/quickstart.py).
+A runnable offline version is in [`examples/quickstart.py`](examples/quickstart.py). Real approvals require configured Ed25519 reviewer public keys and `pip install "jackline[approvals]"`; see [approval setup and enforcement boundaries](docs/enforcement.md).
 
 **Model SDKs.** The adapters need no SDK dependency and accept response objects or plain dicts:
 
 ```python
 from jackline.adapters import anthropic_tools, anthropic_tool_results      # also: openai_tools, openai_tool_messages
 
-resp = client.messages.create(model=..., tools=anthropic_tools(rt, TOOLS), messages=messages)
-messages.append({"role": "user", "content": anthropic_tool_results(session, resp)})  # ← every call governed
+# Establish provider-specific bounds for the ENTIRE request, including retries.
+resp = session.call_model(
+    lambda: client.messages.create(model=MODEL, max_tokens=OUTPUT_BOUND,
+                                  tools=anthropic_tools(rt, TOOLS), messages=messages),
+    model=MODEL, input_tokens_bound=INPUT_BOUND, output_tokens_bound=OUTPUT_BOUND,
+)
+messages.append({"role": "user", "content": anthropic_tool_results(session, resp, record_usage=False)})
 ```
 
-`anthropic_tools()` removes tools the policy can never run, so the model never even sees them. A full loop is in [`examples/anthropic_agent.py`](examples/anthropic_agent.py). It needs an API key and is not exercised in CI. The adapter itself is unit-tested with recorded response shapes.
+`anthropic_tools()` removes tools the policy can never run, so the model never even sees them. A full loop is in [`examples/anthropic_agent.py`](examples/anthropic_agent.py). It needs an API key and is not exercised in CI. The adapter itself is unit-tested with recorded response shapes. `call_model` conservatively reserves the declared upper bound before calling the provider. The default adapter usage recording alone is post-response accounting, not a hard spend ceiling. [Details and provider requirements](docs/enforcement.md#model-budgets).
 
 ## Govern any MCP server without changing code
 
@@ -133,11 +140,12 @@ Put `jackline mcp-proxy` in front of the server in your Claude Desktop, Cursor o
 - `tools/list` responses are filtered: tools that no rule can ever run are hidden from the model.
 - For approval-gated calls, the proxy **waits** for a decision. Approve or deny from another terminal:
   ```bash
-  jackline approvals list --home ~/jackline/.jackline
-  jackline approvals approve 3f9a1c --by tracy --reason "checked the diff" --home ~/jackline/.jackline
+  jackline approvals list --policy jackline.toml --home ~/jackline/.jackline
+  jackline approvals approve 3f9a1c --by tracy --reason "checked the diff" \
+    --signing-key /private/reviewer/tracy.key --policy jackline.toml --home ~/jackline/.jackline
   ```
 - Add `--grant grant.json` (from `jackline grant ...`) to require a task-scoped grant as well. Without it, the proxy enforces policy only.
-- All other JSON-RPC traffic passes through untouched.
+- Malformed `tools/call` notifications without a request ID are dropped. Other JSON-RPC methods pass through; the proxy does not govern side effects outside `tools/call`.
 
 ## Policy
 
@@ -175,7 +183,7 @@ arg_gt = { notional_usd = 1000000 }
 | **Conditions** | `path_within`, `path_not_within`, `path_matches`, `host_in`, `host_not_in`, `arg_matches`, `arg_gt`, `arg_lt`, `args_contain` |
 | **Per rule** | `rate = "5/min"`, `approvers = [...]`, `reason`, `path_arg` / `url_arg` |
 | **Budgets** | `max_steps`, `max_tool_calls`, `max_model_calls`, `max_tokens`, `max_cost_usd` (with per-model prices), `max_wall_time` |
-| **Safety** | Unknown keys are **errors**, so a typo can never silently disable a deny rule. Paths are resolved with `realpath`, so `..` and symlinks can't escape. Host matching is exact or by subdomain (`example.com.evil.net` does not match `example.com`). |
+| **Safety** | Unknown keys are **errors**, so a typo can never silently disable a deny rule. Paths are checked with `realpath`; tool implementations must use the same workspace and prevent check/open races. Host matching is exact or by subdomain (`example.com.evil.net` does not match `example.com`). |
 
 Test policies in CI the way you test code:
 
@@ -201,27 +209,33 @@ jackline replay .jackline/ledger.jsonl --policy candidate.toml --fail-on-change
 
 ## Guarantees and honest limits
 
-**What Jackline guarantees:**
-- **No standing authority.** With `require_grant=True` (the default), a call without a valid, unexpired, correctly signed grant is denied. Wildcard grants are refused at issue time.
-- **Deterministic decisions.** No model is consulted to decide what is allowed. The same policy and the same call always produce the same decision.
-- **Approvals can't be laundered.** An approval is bound to a digest of the exact tool and arguments, can only come from a listed approver, is HMAC-signed (hand-edited approval files are rejected), and expires to DENY.
-- **Exactly-once execution across crashes.** A session checkpoints after every step. A resumed run never re-executes a call that already ran, and a reused call ID with different arguments is denied.
-- **A tamper-evident record.** Editing, deleting, inserting or reordering a ledger entry fails `jackline ledger verify`. Credential-looking values are redacted before anything is written.
+**Controls enforced at Jackline's integration boundary:**
 
-**What it doesn't do (yet):**
-- **It is not a sandbox.** Jackline decides *whether* a tool runs, not *how safely* the tool behaves once it runs. Pair it with OS or container isolation for code-execution tools.
-- **Signatures are HMAC (symmetric).** Keep the key in a secret manager (`JACKLINE_KEY`). Asymmetric and KMS-backed signing is on the roadmap.
-- **Cutting entries off the end of a ledger is only detectable against an anchor.** Store the head hash somewhere immutable.
-- **Replay has limits.** It uses the *redacted* arguments from the ledger and does not re-simulate grant or rate-limit state.
-- **The MCP proxy runs one tool call at a time** per proxy process. It is single-host; a multi-tenant control plane is roadmap work.
-- **The demo's model is scripted.** It shows the controls deterministically. It does not measure any real model's behaviour.
+- **Task-scoped authority.** A call needs a valid, unexpired grant when `require_grant=True` (the default). Grants bind to an explicit task ID and exact tool names. Atomic use limits persist across sessions and restarts sharing one home.
+- **Deterministic policy decisions.** No model decides what is allowed. Unknown configuration keys and invalid security-relevant arguments fail closed.
+- **Authenticated approvals.** Secure mode verifies separate Ed25519 reviewer signatures over the exact call, policy and expiry. A claimed name is insufficient. The runtime checks authority again after review; the demo's trusted-local mode is explicitly unauthenticated.
+- **Crash-safe duplicate prevention.** Durable intent precedes invocation. Completed calls replay; an interrupted call with an unknown outcome returns `uncertain` and is not automatically retried. Run locks also prevent duplicate invocation by concurrent processes.
+- **Budget and rate enforcement.** Run budgets persist, all matching allow/approve rate limits apply, and model calls can reserve bounded cost before invocation.
+- **A tamper-evident record.** Signed checkpoints and a verified, hash-chained ledger reject unauthorized edits. Files are owner-only and recognized secrets are redacted from persisted tool results as well as ledger entries.
+
+**Boundaries that matter:**
+
+- **Exactly-once business effects require destination support.** Jackline provides at-most-once invocation per run/call ID and honest uncertain outcomes. A remote destination must provide idempotency or transactions to establish exactly-once effects. New IDs do not deduplicate an old business operation.
+- **It is not a sandbox.** Tool internals, direct API calls, redirects, DNS resolution and filesystem check/open races require controls in the tool and execution environment. Wall-time budgets do not kill an already-running operation.
+- **Protect the trust boundary.** The agent must not access runtime keys, policy, storage or reviewer private keys. Grant/ledger signatures remain HMAC; reviewer decisions use separate Ed25519 keys. Operator identity-to-key mapping is required; SSO/KMS integrations remain roadmap work.
+- **Model cost bounds are conditional.** `call_model` requires accurate configured prices and provider-enforced input/output/retry bounds. `record_model` is accounting after the response, not prevention of an earlier spend.
+- **Storage is single-host.** Shared local POSIX storage coordinates runs. Separate homes do not share limits; distributed filesystems are unsupported. External anchors are required to detect ledger tail truncation. A complete rollback of signed state is outside these local controls.
+- **Redaction and replay have limits.** Redaction is heuristic. Persisted/replayed outputs may be redacted; policy replay uses redacted arguments and does not simulate grant or rate state.
+- **The demo's model and reviewers are scripted.** It demonstrates controls, not measured resistance of a real model.
+
+See the [full enforcement contract, approval setup and migration instructions](docs/enforcement.md).
 
 ## For B2B teams
 
-- **Self-hosted and offline.** The core makes no network calls (a unit test enforces this). It has no dependencies on Python 3.11+ (3.10 adds `tomli`), and runs on Linux and macOS.
+- **Self-hosted and offline.** The core makes no network calls (a unit test enforces this). The core has no dependencies on Python 3.11+ (3.10 adds `tomli`) and runs on Linux/macOS. Authenticated approvals add the optional `cryptography` dependency.
 - **Policy as code.** Policies are TOML in git, unit-testable with `jackline check`, and can be regression-tested against production traffic with `jackline replay`.
 - **Audit-first.** The ledger is JSON Lines you can ship to a SIEM or a WORM bucket. Anchor the head hash in your change-management system.
-- **Separation of duties.** Grants are issued by one person, approvals come from named approvers, and the runtime itself can't approve anything.
+- **Separation of duties for approval decisions.** Secure mode verifies named reviewers using public keys. Keep reviewer private keys outside the runtime account so it cannot produce those signatures. Local callback demos do not provide this separation.
 
 ## Part of a governed-agent lifecycle
 
@@ -237,11 +251,11 @@ Jackline's own CI is guarded by DeadBolt.
 
 ## How it was built
 
-I architected Jackline and directed Claude as my build agent. I set the design, the security boundaries and the review standard. It's the same pattern Jackline enforces: the model proposes, the system decides what is authorized, and a human decides what happens.
+I architected Jackline and directed Claude as my initial build agent, followed by adversarial review and runtime hardening with Codex. I set the design, the security boundaries and the review standard. It's the same pattern Jackline enforces: the model proposes, the system decides what is authorized, and a human decides what happens.
 
 ## Roadmap
 
-- Ed25519 / cloud-KMS signing for grants, approvals and ledger entries
+- Asymmetric / cloud-KMS signing for grants and ledger entries (Ed25519 reviewer signatures are implemented)
 - OPA/Rego policy export, and SSO-backed approver identity (OIDC)
 - Slack and Teams approval cards
 - Streamable-HTTP MCP transport and a multi-tenant control plane

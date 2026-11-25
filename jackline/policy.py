@@ -17,11 +17,10 @@ silently turn it off.
 from __future__ import annotations
 
 import fnmatch
+import math
 import os
 import re
-import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -94,13 +93,23 @@ class Policy:
     workspace: Path = field(default_factory=Path.cwd)
     approval_timeout_s: float = 300.0
     budget: Budget = field(default_factory=Budget)
-    source_digest: str = ""
+    document_digest: str = ""
+    approver_keys: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def source_digest(self) -> str:
+        # Bind approvals to effective configuration, including resolved workspace
+        # and in-memory changes, not just the original TOML bytes.
+        return digest(asdict(self))
 
     # ----------------------------------------------------------------- loading
     @classmethod
     def from_toml(cls, text: str, base_dir: Path | None = None) -> "Policy":
-        data = load_toml(text)
-        return cls.from_dict(data, base_dir=base_dir, source_digest=digest(data))
+        try:
+            data = load_toml(text)
+            return cls.from_dict(data, base_dir=base_dir, source_digest=digest(data))
+        except (TypeError, ValueError, re.error) as exc:
+            raise PolicyError(str(exc)) from exc
 
     @classmethod
     def load(cls, path: str | Path) -> "Policy":
@@ -113,7 +122,25 @@ class Policy:
         unknown_top = set(data) - {"jackline", "rule", "budget", "approvals"}
         if unknown_top:
             raise PolicyError(f"unknown top-level section(s): {sorted(unknown_top)}")
+        for section in ("jackline", "approvals", "budget"):
+            if not isinstance(data.get(section, {}), dict):
+                raise PolicyError(f"{section} must be a table")
         meta = data.get("jackline", {})
+        if set(meta) - {"name", "default", "workspace"}:
+            raise PolicyError("unknown jackline key")
+        if any(not isinstance(v, str) or not v for v in meta.values()):
+            raise PolicyError("jackline values must be non-empty strings")
+        appr = data.get("approvals", {})
+        if set(appr) - {"timeout", "public_keys"}:
+            raise PolicyError("unknown approvals key")
+        keys = appr.get("public_keys", {})
+        if not isinstance(keys, dict):
+            raise PolicyError("approvals.public_keys must map identities to Ed25519 public-key hex")
+        for identity, key in keys.items():
+            if not isinstance(identity, str) or not identity or not isinstance(key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", key):
+                raise PolicyError("invalid approver public key")
+        if not isinstance(data.get("rule", []), list):
+            raise PolicyError("rule must be an array of tables")
         default = meta.get("default", DENY)
         if default not in (ALLOW, DENY, APPROVE):
             raise PolicyError(f"jackline.default must be allow|deny|approve, got {default!r}")
@@ -122,10 +149,14 @@ class Policy:
         rules: list[Rule] = []
         seen: set[str] = set()
         for i, r in enumerate(data.get("rule", [])):
+            if not isinstance(r, dict):
+                raise PolicyError("rule must be a table")
             unknown = set(r) - RULE_KEYS
             if unknown:
                 raise PolicyError(f"rule #{i + 1} ({r.get('id', '?')}): unknown key(s) {sorted(unknown)}")
             rid = r.get("id") or f"rule-{i + 1}"
+            if not isinstance(rid, str):
+                raise PolicyError("rule id must be a string")
             if rid in seen:
                 raise PolicyError(f"duplicate rule id {rid!r}")
             seen.add(rid)
@@ -135,12 +166,33 @@ class Policy:
             tools = r.get("tools")
             if isinstance(tools, str):
                 tools = [tools]
-            if not tools or not all(isinstance(t, str) for t in tools):
+            if not isinstance(tools, list) or not tools or not all(isinstance(t, str) and t for t in tools):
                 raise PolicyError(f"rule {rid!r}: 'tools' must be a non-empty list of glob patterns")
+            if not isinstance(r.get("when", {}), dict):
+                raise PolicyError("rule.when must be a table")
+            for name in ("reason", "path_arg", "url_arg", "description"):
+                if name in r and not isinstance(r[name], str):
+                    raise PolicyError(f"{name} must be a string")
+            if not isinstance(r.get("approvers", []), list) or any(not isinstance(a, str) or not a for a in r.get("approvers", [])):
+                raise PolicyError("approvers must be a list of identities")
             when = dict(r.get("when", {}))
             bad = set(when) - CONDITION_KEYS
             if bad:
                 raise PolicyError(f"rule {rid!r}: unknown condition(s) {sorted(bad)}; allowed: {sorted(CONDITION_KEYS)}")
+            for k, value in when.items():
+                if k in ("arg_gt", "arg_lt", "arg_matches"):
+                    if not isinstance(value, dict) or not value:
+                        raise PolicyError(f"{k} must be a non-empty table")
+                    for arg, val in value.items():
+                        if not isinstance(arg, str) or not arg:
+                            raise PolicyError("condition argument must be a name")
+                        if k == "arg_matches":
+                            if not isinstance(val, str):
+                                raise PolicyError("argument regex must be a string")
+                        elif type(val) not in (int, float) or not math.isfinite(val):
+                            raise PolicyError("numeric thresholds must be finite numbers")
+                elif not isinstance(value, list) or not value or any(not isinstance(v, str) or not v for v in value):
+                    raise PolicyError(f"{k} must be a non-empty string list")
             for k in ("path_within", "path_not_within"):
                 if k in when:
                     when[k] = [_resolve(p, ws) for p in when[k]]
@@ -149,7 +201,7 @@ class Policy:
                     when[k] = {a: re.compile(p) for a, p in when[k].items()}
             if "args_contain" in when:
                 when["args_contain"] = [re.compile(p) for p in when["args_contain"]]
-            if r.get("rate"):
+            if "rate" in r:
                 _parse_rate(r["rate"])  # validate early
             rules.append(Rule(
                 id=rid, tools=tuple(tools), effect=effect, when=when, rate=r.get("rate"),
@@ -162,6 +214,19 @@ class Policy:
                               "max_wall_time", "prices"}
         if unknown_b:
             raise PolicyError(f"unknown budget key(s): {sorted(unknown_b)}")
+        for name in ("max_steps", "max_tool_calls", "max_model_calls", "max_tokens"):
+            if name in b and (type(b[name]) is not int or b[name] < 0):
+                raise PolicyError(f"{name} must be a non-negative integer")
+        if "max_cost_usd" in b and (type(b["max_cost_usd"]) not in (int, float) or not math.isfinite(b["max_cost_usd"]) or b["max_cost_usd"] < 0):
+            raise PolicyError("max_cost_usd must be finite and non-negative")
+        prices = b.get("prices", {})
+        if not isinstance(prices, dict):
+            raise PolicyError("prices must be a table")
+        for model, price in prices.items():
+            if not isinstance(price, dict) or set(price) != {"input_per_mtok", "output_per_mtok"}:
+                raise PolicyError(f"{model}: specify both input_per_mtok and output_per_mtok, no other keys")
+            if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in price.values()):
+                raise PolicyError("prices must be finite and non-negative")
         budget = Budget(
             max_steps=b.get("max_steps"), max_tool_calls=b.get("max_tool_calls"),
             max_model_calls=b.get("max_model_calls"), max_tokens=b.get("max_tokens"),
@@ -173,11 +238,29 @@ class Policy:
         return cls(
             name=meta.get("name", "unnamed-policy"), rules=rules, default=default, workspace=ws,
             approval_timeout_s=parse_duration(appr.get("timeout", "5m")), budget=budget,
-            source_digest=source_digest or digest(data),
+            document_digest=source_digest or digest(data), approver_keys=keys,
         )
 
     # --------------------------------------------------------------- evaluate
     def evaluate(self, tool: str, args: dict[str, Any]) -> Decision:
+        if not isinstance(args, dict):
+            return Decision(DENY, ["invalid-arguments"], ["arguments must be an object"], self.source_digest)
+        # Missing or malformed security-relevant arguments must not disable a deny rule.
+        for r in self.rules:
+            if not r.covers(tool):
+                continue
+            invalid = False
+            for key, condition in r.when.items():
+                if key.startswith("path_"):
+                    invalid |= not isinstance(args.get(r.path_arg), str) or not args.get(r.path_arg)
+                elif key.startswith("host_"):
+                    invalid |= not isinstance(args.get(r.url_arg), str) or not _host(args.get(r.url_arg, ""))
+                elif key in ("arg_gt", "arg_lt"):
+                    invalid |= any(_num(args.get(a)) is None for a in condition)
+                elif key == "arg_matches":
+                    invalid |= any(not isinstance(args.get(a), (str, int, float)) for a in condition)
+            if invalid:
+                return Decision(DENY, ["invalid-arguments"], [f"missing or invalid argument required by {r.id}"], self.source_digest)
         matched = [r for r in self.rules if r.covers(tool) and _conditions_hold(r, args, self.workspace)]
         for effect in (DENY, APPROVE, ALLOW):
             hits = [r for r in matched if r.effect == effect]
@@ -218,7 +301,8 @@ def _host_match(host: str, domains: list[str]) -> bool:
 
 def _num(v: Any) -> float | None:
     try:
-        return float(v)
+        n = float(v)
+        return n if not isinstance(v, bool) and math.isfinite(n) else None
     except (TypeError, ValueError):
         return None
 
@@ -277,29 +361,8 @@ _RATE = re.compile(r"^\s*(\d+)\s*/\s*(s|sec|second|m|min|minute|h|hour|d|day)\s*
 
 
 def _parse_rate(rate: str) -> tuple[int, float]:
-    m = _RATE.match(rate)
+    m = _RATE.match(rate) if isinstance(rate, str) else None
     if not m:
         raise PolicyError(f"bad rate {rate!r}; use e.g. '10/min'")
     unit = m.group(2)[0]
     return int(m.group(1)), {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-
-
-class RateLimiter:
-    """Sliding-window limiter keyed by rule id. Deterministic given a clock."""
-
-    def __init__(self, clock=time.monotonic) -> None:
-        self.clock = clock
-        self.hits: dict[str, deque[float]] = defaultdict(deque)
-
-    def check(self, rule: Rule) -> bool:
-        if not rule.rate:
-            return True
-        limit, window = _parse_rate(rule.rate)
-        now = self.clock()
-        q = self.hits[rule.id]
-        while q and now - q[0] >= window:
-            q.popleft()
-        if len(q) >= limit:
-            return False
-        q.append(now)
-        return True
